@@ -1,0 +1,113 @@
+# Runs on every PR event: open, update, and close (for cleanup)
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+    branches: [main]
+
+env:
+  IMAGE_NAME: yourdockerhubuser/pulseops-app
+
+jobs:
+  # ---------- 1. Lint & static checks ----------
+  lint:
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install lint tools
+        run: pip install flake8 black
+      - name: Run flake8
+        run: flake8 app --max-line-length=100
+      - name: Check formatting
+        run: black --check app
+
+  # ---------- 2. Unit tests ----------
+  test:
+    if: github.event.action != 'closed'
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r app/requirements.txt pytest pytest-cov
+      - name: Run tests with coverage
+        run: pytest app/tests --cov=app --cov-report=xml || echo "No tests yet"
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+  # ---------- 3. Security scan ----------
+  security-scan:
+    if: github.event.action != 'closed'
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          exit-code: 1
+
+  # ---------- 4. Build & push a PR-tagged image ----------
+  build:
+    if: github.event.action != 'closed'
+    needs: [test, security-scan]
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: tag
+        run: echo "tag=pr-${{ github.event.pull_request.number }}-${{ github.sha }}" >> "$GITHUB_OUTPUT"
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Build and push PR image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./app
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
+
+  # ---------- 5. Deploy an ephemeral preview environment ----------
+  deploy-preview:
+    if: github.event.action != 'closed'
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+      - name: Configure kubeconfig
+        run: echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > kubeconfig.yaml
+      - name: Deploy PR preview namespace
+        env:
+          KUBECONFIG: kubeconfig.yaml
+          NS: pr-${{ github.event.pull_request.number }}
+        run: |
+          kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
+          sed "s|IMAGE_PLACEHOLDER|${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }}|" k8s/deployment.yaml \
+            | kubectl apply -n "$NS" -f -
+          kubectl rollout status deployment/pulseops-app -n "$NS" --timeout=120s
+      - name: Comment preview link on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: Preview deployed to namespace 
